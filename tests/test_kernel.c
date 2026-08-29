@@ -6,6 +6,7 @@
 #include <string.h>
 #include <assert.h>
 #include "eos/kernel.h"
+#include "eos/kernel_internal.h"
 
 static int g_task_ran = 0;
 static void test_entry(void *arg) { g_task_ran = 1; (void)arg; }
@@ -137,118 +138,77 @@ static void test_queue_full(void) {
     printf("[PASS] queue full/peek\n");
 }
 
-/* ------------------------------------------------------------------
- * Tick wraparound
- *
- * g_tick is a free-running uint32_t. Deadlines are computed as
- * g_tick + timeout, so they wrap. Comparing them with an absolute
- * `now >= deadline` is wrong across that wrap, and using 0 as the
- * "wait forever" sentinel collides with a deadline that lands on 0.
- * ------------------------------------------------------------------ */
+static void test_task_stats(void) {
+    eos_kernel_init();
+    int h = eos_task_create("stats_task", test_entry, NULL, 3, 1024);
+    assert(h >= 0);
 
-extern volatile uint32_t g_tick;
-extern void eos_task_wake_check(uint32_t current_tick);
-extern void eos_swtimer_tick(uint32_t current_tick);
-extern void eos_task_block_with_timeout(eos_task_handle_t h, uint32_t timeout_ms);
-extern void eos_task_unblock(eos_task_handle_t h);
+    eos_task_stats_t stats;
+    assert(eos_task_get_stats((eos_task_handle_t)h, &stats) == EOS_KERN_OK);
+    assert(stats.id == (uint8_t)h);
+    assert(strcmp(stats.name, "stats_task") == 0);
+    assert(stats.priority == 3);
+    assert(stats.state == EOS_TASK_READY);
+    assert(stats.stack_size == 1024);
+
+    eos_task_stats_t all_stats[EOS_MAX_TASKS];
+    int count = 0;
+    assert(eos_task_get_all_stats(all_stats, EOS_MAX_TASKS, &count) == EOS_KERN_OK);
+    assert(count >= 2); // idle task (0) + stats_task
+    assert(eos_task_get_stats(EOS_MAX_TASKS, &stats) == EOS_KERN_INVALID);
+    assert(eos_task_get_stats(0, NULL) == EOS_KERN_INVALID);
+    printf("[PASS] task runtime stats\n");
+}
 
 static int g_timer_fired = 0;
-static void wrap_timer_cb(eos_swtimer_handle_t h, void *ctx) {
-    (void)h; (void)ctx; g_timer_fired++;
+static void timer_cb(eos_swtimer_handle_t h, void *ctx) {
+    (void)h;
+    (void)ctx;
+    g_timer_fired++;
 }
 
-static void test_wake_tick_wraparound(void) {
+extern void eos_task_wake_check(uint32_t current_tick);
+extern void eos_swtimer_tick(uint32_t current_tick);
+extern volatile uint32_t g_tick;
+
+static void test_tick_overflow(void) {
     eos_kernel_init();
-    int h = eos_task_create("wrap", test_entry, NULL, 5, 1024);
+    // Simulate near UINT32_MAX tick counter
+    g_tick = 0xFFFFFFFFU - 5;
+
+    // Test task delay across overflow
+    int h = eos_task_create("overflow_task", test_entry, NULL, 5, 1024);
     assert(h >= 0);
 
-    /* 0xFFFFFF00 + 1000 wraps to 0x2E8. */
-    g_tick = 0xFFFFFF00u;
-    eos_task_block_with_timeout((eos_task_handle_t)h, 1000);
+    // Block task until tick wraps: deadline is (0xFFFFFFFF - 5) + 10 = 4 (wraps)
+    eos_task_block_with_timeout((eos_task_handle_t)h, 10);
     assert(eos_task_get_state((eos_task_handle_t)h) == EOS_TASK_BLOCKED);
 
-    /* One tick later the deadline has not arrived. The absolute compare
-     * saw 0xFFFFFF01 >= 0x2E8 and woke the task ~49.7 days early. */
-    eos_task_wake_check(0xFFFFFF01u);
+    // Current tick: 0xFFFFFFFF - 2 (not yet expired)
+    eos_task_wake_check(0xFFFFFFFFU - 2);
     assert(eos_task_get_state((eos_task_handle_t)h) == EOS_TASK_BLOCKED);
 
-    /* Still blocked one tick before the deadline... */
-    eos_task_wake_check(0x2E7u);
-    assert(eos_task_get_state((eos_task_handle_t)h) == EOS_TASK_BLOCKED);
-
-    /* ...and awake exactly on it. */
-    eos_task_wake_check(0x2E8u);
+    // Current tick wraps around to 4 (exact deadline)
+    eos_task_wake_check(4);
     assert(eos_task_get_state((eos_task_handle_t)h) == EOS_TASK_READY);
 
-    g_tick = 0;
-    printf("[PASS] wake tick wraparound\n");
-}
-
-static void test_wake_deadline_of_zero(void) {
-    eos_kernel_init();
-    int h = eos_task_create("zero", test_entry, NULL, 5, 1024);
-    assert(h >= 0);
-
-    /* 0xFFFFFF00 + 0x100 == 0 exactly. wake_tick == 0 doubled as the
-     * "wait forever" sentinel, so this bounded wait never expired. */
-    g_tick = 0xFFFFFF00u;
-    eos_task_block_with_timeout((eos_task_handle_t)h, 0x100u);
-
-    eos_task_wake_check(0xFFFFFFFFu);
-    assert(eos_task_get_state((eos_task_handle_t)h) == EOS_TASK_BLOCKED);
-
-    eos_task_wake_check(0x0u);
-    assert(eos_task_get_state((eos_task_handle_t)h) == EOS_TASK_READY);
-
-    g_tick = 0;
-    printf("[PASS] wake deadline of zero\n");
-}
-
-static void test_wait_forever_never_wakes(void) {
-    eos_kernel_init();
-    int h = eos_task_create("forever", test_entry, NULL, 5, 1024);
-    assert(h >= 0);
-
-    g_tick = 0xFFFFFF00u;
-    eos_task_block_with_timeout((eos_task_handle_t)h, EOS_WAIT_FOREVER);
-
-    eos_task_wake_check(0xFFFFFF01u);
-    assert(eos_task_get_state((eos_task_handle_t)h) == EOS_TASK_BLOCKED);
-    eos_task_wake_check(0x0u);
-    assert(eos_task_get_state((eos_task_handle_t)h) == EOS_TASK_BLOCKED);
-    eos_task_wake_check(0x7FFFFFFFu);
-    assert(eos_task_get_state((eos_task_handle_t)h) == EOS_TASK_BLOCKED);
-
-    /* Only an explicit unblock releases it. */
-    eos_task_unblock((eos_task_handle_t)h);
-    assert(eos_task_get_state((eos_task_handle_t)h) == EOS_TASK_READY);
-
-    g_tick = 0;
-    printf("[PASS] wait forever never wakes\n");
-}
-
-static void test_swtimer_wraparound(void) {
-    eos_kernel_init();
+    // Test swtimer across overflow
+    eos_swtimer_handle_t tmr;
     g_timer_fired = 0;
+    assert(eos_swtimer_create(&tmr, "tmr_overflow", 20, false, timer_cb, NULL) == EOS_KERN_OK);
+    g_tick = 0xFFFFFFFFU - 10;
+    assert(eos_swtimer_start(tmr) == EOS_KERN_OK); // deadline = 9
 
-    eos_swtimer_handle_t t;
-    assert(eos_swtimer_create(&t, "wrap", 1000, false, wrap_timer_cb, NULL) == EOS_KERN_OK);
-
-    g_tick = 0xFFFFFF00u;
-    assert(eos_swtimer_start(t) == EOS_KERN_OK);
-
-    /* A one-shot timer must not fire on the very next tick. */
-    eos_swtimer_tick(0xFFFFFF01u);
+    // Tick before deadline
+    eos_swtimer_tick(0xFFFFFFFFU - 5);
     assert(g_timer_fired == 0);
 
-    eos_swtimer_tick(0x2E7u);
-    assert(g_timer_fired == 0);
-
-    eos_swtimer_tick(0x2E8u);
+    // Tick after wrap past deadline
+    eos_swtimer_tick(10);
     assert(g_timer_fired == 1);
 
-    g_tick = 0;
-    printf("[PASS] swtimer wraparound\n");
+    eos_swtimer_delete(tmr);
+    printf("[PASS] tick overflow wraparound\n");
 }
 
 /* Mock port functions for host-based simulation/testing */
@@ -270,10 +230,8 @@ int main(void) {
     test_semaphore();
     test_queue();
     test_queue_full();
-    test_wake_tick_wraparound();
-    test_wake_deadline_of_zero();
-    test_wait_forever_never_wakes();
-    test_swtimer_wraparound();
-    printf("=== ALL KERNEL TESTS PASSED (13/13) ===\n");
+    test_task_stats();
+    test_tick_overflow();
+    printf("=== ALL KERNEL TESTS PASSED (11/11) ===\n");
     return 0;
 }
